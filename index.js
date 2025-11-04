@@ -10,7 +10,7 @@ require("dotenv").config();
 
 const app = express();
 const port = process.env.PORT || 5000;
-const publicDomain = process.env.PUBLIC_DOMAIN || "https://vasya010-backend1-10db.twc1.net";
+const publicDomain = process.env.PUBLIC_DOMAIN || "https://vasya010-nurbek-b586.twc1.net";
 const jwtSecret = process.env.JWT_SECRET || "your_jwt_secret_123";
 
 // Valid roles for validation
@@ -33,7 +33,7 @@ const bucketName = process.env.S3_BUCKET || "a2c31109-3cf2c97b-aca1-42b0-a822-3e
 
 
 app.use(cors({
-  origin: 'https://kurutnet.online', // Explicitly allow your frontend origin
+  origin: 'https://nurnet.website', // Explicitly allow your frontend origin
   credentials: true, // Allow credentials (cookies, authorization headers)
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
