@@ -10,7 +10,7 @@ require("dotenv").config();
 
 const app = express();
 const port = process.env.PORT || 5000;
-const publicDomain = process.env.PUBLIC_DOMAIN || "https://vasya010-nurbek-b586.twc1.net";
+const publicDomain = process.env.PUBLIC_DOMAIN || "https://vasya010-nurbek-b586.twc1.net" || "http://localhost:3000";
 const jwtSecret = process.env.JWT_SECRET || "your_jwt_secret_123";
 
 // Valid roles for validation
