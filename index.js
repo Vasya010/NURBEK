@@ -2514,7 +2514,7 @@ app.get("/api/variants", authenticate, async (req, res) => {
     const sql =
       "SELECT id, mkv, address, price, status, curator_id, created_at FROM properties" +
       (where.length ? ` WHERE ${where.join(" AND ")}` : "") +
-      " ORDER BY created_at DESC";
+      " ORDER BY id ASC";
     const [rows] = await connection.execute(sql, params);
     res.json(
       rows.map((row) => ({
