@@ -32,11 +32,23 @@ const bucketName = process.env.S3_BUCKET || "a2c31109-3cf2c97b-aca1-42b0-a822-3e
 
 
 
+// Разрешённые origin'ы. Можно расширить через env CORS_ORIGINS (через запятую).
+const allowedOrigins = [
+  "https://nurnet.website",
+  "http://localhost:3000",
+  "http://localhost:5173",
+  "http://localhost:5174",
+  "http://127.0.0.1:5173",
+  "http://127.0.0.1:5174",
+  ...(process.env.CORS_ORIGINS ? process.env.CORS_ORIGINS.split(",").map((s) => s.trim()).filter(Boolean) : []),
+];
+
 app.use(cors({
-  origin: [
-    "https://nurnet.website",
-    "http://localhost:3000"
-  ],
+  origin: (origin, callback) => {
+    // Разрешаем запросы без origin (Postman, curl, server-to-server)
+    if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error(`CORS: origin ${origin} не разрешён`));
+  },
   credentials: true,
   methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
