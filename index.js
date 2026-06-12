@@ -2359,6 +2359,601 @@ app.patch("/api/properties/redirect", authenticate, async (req, res) => {
   }
 });
 
+// =====================================================================
+//  NOVA: дополнительные таблицы и эндпоинты для дашборда
+// =====================================================================
+
+async function ensureNovaTables() {
+  let connection;
+  try {
+    connection = await pool.getConnection();
+
+    await connection.execute(`
+      CREATE TABLE IF NOT EXISTS branches (
+        id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        code VARCHAR(100) DEFAULT NULL,
+        city VARCHAR(255) DEFAULT NULL,
+        address TEXT DEFAULT NULL,
+        phone VARCHAR(100) DEFAULT NULL,
+        email VARCHAR(255) DEFAULT NULL,
+        director_name VARCHAR(255) DEFAULT NULL,
+        work_hours VARCHAR(255) DEFAULT NULL,
+        notes TEXT DEFAULT NULL,
+        sort_order INT NOT NULL DEFAULT 0,
+        is_active TINYINT(1) NOT NULL DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      ) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci
+    `);
+
+    await connection.execute(`
+      CREATE TABLE IF NOT EXISTS site_access (
+        id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        valid_until DATETIME DEFAULT NULL,
+        payment_amount DECIMAL(15,2) DEFAULT NULL,
+        payment_currency VARCHAR(10) NOT NULL DEFAULT 'KGS',
+        payment_note TEXT DEFAULT NULL,
+        maintenance_mode TINYINT(1) NOT NULL DEFAULT 0,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      ) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci
+    `);
+    const [saRows] = await connection.execute("SELECT id FROM site_access LIMIT 1");
+    if (saRows.length === 0) {
+      await connection.execute(
+        "INSERT INTO site_access (valid_until, maintenance_mode) VALUES (NULL, 0)"
+      );
+    }
+
+    await connection.execute(`
+      CREATE TABLE IF NOT EXISTS notifications (
+        id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        title VARCHAR(255) NOT NULL,
+        message TEXT NOT NULL,
+        level VARCHAR(20) NOT NULL DEFAULT 'info',
+        target_role VARCHAR(50) NOT NULL DEFAULT 'ALL',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      ) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci
+    `);
+
+    await connection.execute(`
+      CREATE TABLE IF NOT EXISTS notification_reads (
+        notification_id INT UNSIGNED NOT NULL,
+        user_id INT UNSIGNED NOT NULL,
+        read_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (notification_id, user_id)
+      ) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci
+    `);
+
+    await connection.execute(`
+      CREATE TABLE IF NOT EXISTS password_resets (
+        id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        user_id INT UNSIGNED NOT NULL,
+        token VARCHAR(255) NOT NULL,
+        expires_at DATETIME NOT NULL,
+        used TINYINT(1) NOT NULL DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      ) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci
+    `);
+
+    console.log("Nova tables ensured (branches, site_access, notifications, ...)");
+  } catch (error) {
+    console.error("ensureNovaTables error:", { message: error.message, code: error.code, sqlMessage: error.sqlMessage });
+  } finally {
+    if (connection) connection.release();
+  }
+}
+
+ensureNovaTables();
+
+const requireSuperAdmin = (req, res) => {
+  if (req.user.role !== "SUPER_ADMIN") {
+    res.status(403).json({ error: "Доступ запрещён: требуется роль SUPER_ADMIN" });
+    return false;
+  }
+  return true;
+};
+
+// --- Текущий пользователь ---------------------------------------------
+app.get("/api/me", authenticate, async (req, res) => {
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    const [rows] = await connection.execute(
+      "SELECT id, first_name, last_name, email, phone, role, profile_picture AS photoUrl FROM users1 WHERE id = ?",
+      [req.user.id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: "Пользователь не найден" });
+    const u = rows[0];
+    res.json({
+      ...u,
+      name: `${u.first_name} ${u.last_name}`.trim(),
+      photoUrl: u.photoUrl ? `https://s3.twcstorage.ru/${bucketName}/${u.photoUrl}` : null,
+    });
+  } catch (error) {
+    console.error("Error /api/me:", error.message);
+    res.status(500).json({ error: `Внутренняя ошибка сервера: ${error.message}` });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// --- Кураторы (список пользователей) ----------------------------------
+app.get("/api/curators", authenticate, async (req, res) => {
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    const [rows] = await connection.execute(
+      "SELECT id, CONCAT(first_name, ' ', last_name) AS name, role FROM users1 ORDER BY first_name, last_name"
+    );
+    res.json(rows.map((r) => ({ id: r.id, name: r.name.trim(), role: r.role })));
+  } catch (error) {
+    console.error("Error /api/curators:", error.message);
+    res.status(500).json({ error: `Внутренняя ошибка сервера: ${error.message}` });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// --- Варианты объектов (на базе properties) ---------------------------
+app.get("/api/variants", authenticate, async (req, res) => {
+  const mode = req.query.mode === "mine" ? "mine" : "all";
+  const filterId = req.query.id ? parseInt(req.query.id, 10) : null;
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    const where = [];
+    const params = [];
+    if (mode === "mine") {
+      where.push("curator_id = ?");
+      params.push(req.user.id);
+    }
+    if (filterId && !Number.isNaN(filterId)) {
+      where.push("curator_id = ?");
+      params.push(filterId);
+    }
+    const sql =
+      "SELECT id, mkv, address, price, status, curator_id, created_at FROM properties" +
+      (where.length ? ` WHERE ${where.join(" AND ")}` : "") +
+      " ORDER BY created_at DESC";
+    const [rows] = await connection.execute(sql, params);
+    res.json(
+      rows.map((row) => ({
+        id: row.id,
+        date: new Date(row.created_at).toLocaleDateString("ru-RU"),
+        time: new Date(row.created_at).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }),
+        area: row.mkv,
+        district: row.address,
+        price: row.price,
+        status: row.status,
+        curator_id: row.curator_id,
+      }))
+    );
+  } catch (error) {
+    console.error("Error /api/variants:", error.message);
+    res.status(500).json({ error: `Внутренняя ошибка сервера: ${error.message}` });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+app.get("/api/variants/:id", authenticate, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (Number.isNaN(id)) return res.status(400).json({ error: "Некорректный id" });
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    const [rows] = await connection.execute(
+      `SELECT p.*, CONCAT(u.first_name, ' ', u.last_name) AS curator_name
+       FROM properties p
+       LEFT JOIN users1 u ON p.curator_id = u.id
+       WHERE p.id = ?`,
+      [id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: "Вариант не найден" });
+    const row = rows[0];
+    let parsedPhotos = [];
+    if (row.photos) {
+      try { parsedPhotos = JSON.parse(row.photos) || []; } catch { parsedPhotos = []; }
+    }
+    res.json({
+      ...row,
+      photos: parsedPhotos.map((img) => `https://s3.twcstorage.ru/${bucketName}/${img}`),
+      document: row.document ? `https://s3.twcstorage.ru/${bucketName}/${row.document}` : null,
+      date: new Date(row.created_at).toLocaleDateString("ru-RU"),
+      time: new Date(row.created_at).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }),
+      curator_name: row.curator_name || null,
+    });
+  } catch (error) {
+    console.error("Error /api/variants/:id:", error.message);
+    res.status(500).json({ error: `Внутренняя ошибка сервера: ${error.message}` });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+app.post("/api/variants", authenticate, async (req, res) => {
+  const b = req.body || {};
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    const [result] = await connection.execute(
+      `INSERT INTO properties
+        (type_id, price, rukprice, mkv, address, status, curator_id, district_id, subdistrict_id, rooms, etaj, etajnost, document_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+      [
+        b.type_id ?? null,
+        Number(b.price) || 0,
+        Number(b.rukprice) || 0,
+        Number(b.mkv) || 0,
+        b.address ?? "",
+        b.status ?? null,
+        b.curator_id ? parseInt(b.curator_id, 10) : req.user.id,
+        b.district_id ?? null,
+        b.subdistrict_id ?? null,
+        b.rooms ?? null,
+        Number(b.etaj) || 0,
+        Number(b.etajnost) || 0,
+      ]
+    );
+    res.status(201).json({ id: result.insertId, message: "Вариант создан" });
+  } catch (error) {
+    console.error("Error POST /api/variants:", error.message);
+    res.status(500).json({ error: `Внутренняя ошибка сервера: ${error.message}` });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// --- Филиалы ----------------------------------------------------------
+const BRANCH_FIELDS = ["name", "code", "city", "address", "phone", "email", "director_name", "work_hours", "notes", "sort_order", "is_active"];
+
+app.get("/api/branches", authenticate, async (req, res) => {
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    const [rows] = await connection.execute("SELECT * FROM branches ORDER BY sort_order ASC, id ASC");
+    res.json(rows);
+  } catch (error) {
+    console.error("Error GET /api/branches:", error.message);
+    res.status(500).json({ error: `Внутренняя ошибка сервера: ${error.message}` });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+app.post("/api/branches", authenticate, async (req, res) => {
+  if (!requireSuperAdmin(req, res)) return;
+  const b = req.body || {};
+  if (!b.name) return res.status(400).json({ error: "Поле name обязательно" });
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    const [result] = await connection.execute(
+      `INSERT INTO branches (name, code, city, address, phone, email, director_name, work_hours, notes, sort_order, is_active)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        b.name,
+        b.code ?? null,
+        b.city ?? null,
+        b.address ?? null,
+        b.phone ?? null,
+        b.email ?? null,
+        b.director_name ?? null,
+        b.work_hours ?? null,
+        b.notes ?? null,
+        Number(b.sort_order) || 0,
+        b.is_active === 0 || b.is_active === false ? 0 : 1,
+      ]
+    );
+    const [rows] = await connection.execute("SELECT * FROM branches WHERE id = ?", [result.insertId]);
+    res.status(201).json(rows[0]);
+  } catch (error) {
+    console.error("Error POST /api/branches:", error.message);
+    res.status(500).json({ error: `Внутренняя ошибка сервера: ${error.message}` });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+app.put("/api/branches/:id", authenticate, async (req, res) => {
+  if (!requireSuperAdmin(req, res)) return;
+  const id = parseInt(req.params.id, 10);
+  if (Number.isNaN(id)) return res.status(400).json({ error: "Некорректный id" });
+  const b = req.body || {};
+  const sets = [];
+  const params = [];
+  for (const f of BRANCH_FIELDS) {
+    if (b[f] !== undefined) {
+      sets.push(`${f} = ?`);
+      if (f === "sort_order") params.push(Number(b[f]) || 0);
+      else if (f === "is_active") params.push(b[f] === 0 || b[f] === false ? 0 : 1);
+      else params.push(b[f]);
+    }
+  }
+  if (sets.length === 0) return res.status(400).json({ error: "Нет полей для обновления" });
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    params.push(id);
+    await connection.execute(`UPDATE branches SET ${sets.join(", ")} WHERE id = ?`, params);
+    const [rows] = await connection.execute("SELECT * FROM branches WHERE id = ?", [id]);
+    if (rows.length === 0) return res.status(404).json({ error: "Филиал не найден" });
+    res.json(rows[0]);
+  } catch (error) {
+    console.error("Error PUT /api/branches/:id:", error.message);
+    res.status(500).json({ error: `Внутренняя ошибка сервера: ${error.message}` });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+app.delete("/api/branches/:id", authenticate, async (req, res) => {
+  if (!requireSuperAdmin(req, res)) return;
+  const id = parseInt(req.params.id, 10);
+  if (Number.isNaN(id)) return res.status(400).json({ error: "Некорректный id" });
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.execute("DELETE FROM branches WHERE id = ?", [id]);
+    res.json({ message: "Филиал удалён" });
+  } catch (error) {
+    console.error("Error DELETE /api/branches/:id:", error.message);
+    res.status(500).json({ error: `Внутренняя ошибка сервера: ${error.message}` });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// --- Доступ к сайту / подписка ----------------------------------------
+function buildSiteAccess(row) {
+  const validUntil = row && row.valid_until ? new Date(row.valid_until) : null;
+  const active = !validUntil || validUntil.getTime() > Date.now();
+  return {
+    active,
+    validUntil: validUntil ? validUntil.toISOString() : null,
+    maintenance: !!(row && row.maintenance_mode),
+  };
+}
+
+async function getSiteAccessRow(connection) {
+  const [rows] = await connection.execute("SELECT * FROM site_access ORDER BY id ASC LIMIT 1");
+  if (rows.length === 0) {
+    await connection.execute("INSERT INTO site_access (valid_until, maintenance_mode) VALUES (NULL, 0)");
+    const [again] = await connection.execute("SELECT * FROM site_access ORDER BY id ASC LIMIT 1");
+    return again[0];
+  }
+  return rows[0];
+}
+
+app.get("/public/site-access", async (req, res) => {
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    const row = await getSiteAccessRow(connection);
+    res.json(buildSiteAccess(row));
+  } catch (error) {
+    console.error("Error /public/site-access:", error.message);
+    // Fail-open, чтобы не блокировать вход при сбое БД
+    res.json({ active: true, validUntil: null, maintenance: false });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+app.get("/api/dev/site-access", authenticate, async (req, res) => {
+  if (!requireSuperAdmin(req, res)) return;
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    const row = await getSiteAccessRow(connection);
+    res.json({
+      ...buildSiteAccess(row),
+      payment_amount: row.payment_amount != null ? Number(row.payment_amount) : null,
+      payment_currency: row.payment_currency || "KGS",
+      payment_note: row.payment_note ?? null,
+      maintenance_mode: !!row.maintenance_mode,
+    });
+  } catch (error) {
+    console.error("Error GET /api/dev/site-access:", error.message);
+    res.status(500).json({ error: `Внутренняя ошибка сервера: ${error.message}` });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+app.put("/api/dev/site-access", authenticate, async (req, res) => {
+  if (!requireSuperAdmin(req, res)) return;
+  const b = req.body || {};
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    const row = await getSiteAccessRow(connection);
+    const sets = [];
+    const params = [];
+    if (b.valid_until !== undefined) {
+      sets.push("valid_until = ?");
+      params.push(b.valid_until ? new Date(b.valid_until).toISOString().slice(0, 19).replace("T", " ") : null);
+    }
+    if (b.payment_amount !== undefined) { sets.push("payment_amount = ?"); params.push(b.payment_amount != null ? Number(b.payment_amount) : null); }
+    if (b.payment_currency !== undefined) { sets.push("payment_currency = ?"); params.push(b.payment_currency || "KGS"); }
+    if (b.payment_note !== undefined) { sets.push("payment_note = ?"); params.push(b.payment_note ?? null); }
+    if (b.maintenance_mode !== undefined) { sets.push("maintenance_mode = ?"); params.push(b.maintenance_mode ? 1 : 0); }
+    if (sets.length > 0) {
+      params.push(row.id);
+      await connection.execute(`UPDATE site_access SET ${sets.join(", ")} WHERE id = ?`, params);
+    }
+    const updated = await getSiteAccessRow(connection);
+    res.json({
+      ...buildSiteAccess(updated),
+      payment_amount: updated.payment_amount != null ? Number(updated.payment_amount) : null,
+      payment_currency: updated.payment_currency || "KGS",
+      payment_note: updated.payment_note ?? null,
+      maintenance_mode: !!updated.maintenance_mode,
+    });
+  } catch (error) {
+    console.error("Error PUT /api/dev/site-access:", error.message);
+    res.status(500).json({ error: `Внутренняя ошибка сервера: ${error.message}` });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// --- Уведомления ------------------------------------------------------
+app.get("/api/notifications", authenticate, async (req, res) => {
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    const [rows] = await connection.execute(
+      `SELECT n.*, (nr.user_id IS NOT NULL) AS is_read
+       FROM notifications n
+       LEFT JOIN notification_reads nr ON nr.notification_id = n.id AND nr.user_id = ?
+       WHERE n.target_role = 'ALL' OR n.target_role = ?
+       ORDER BY n.created_at DESC
+       LIMIT 100`,
+      [req.user.id, req.user.role]
+    );
+    res.json(rows.map((r) => ({ ...r, is_read: !!r.is_read })));
+  } catch (error) {
+    console.error("Error GET /api/notifications:", error.message);
+    res.status(500).json({ error: `Внутренняя ошибка сервера: ${error.message}` });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+app.post("/api/notifications/:id/read", authenticate, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (Number.isNaN(id)) return res.status(400).json({ error: "Некорректный id" });
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.execute(
+      "INSERT IGNORE INTO notification_reads (notification_id, user_id) VALUES (?, ?)",
+      [id, req.user.id]
+    );
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("Error POST /api/notifications/:id/read:", error.message);
+    res.status(500).json({ error: `Внутренняя ошибка сервера: ${error.message}` });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+app.post("/api/dev/notifications/broadcast", authenticate, async (req, res) => {
+  if (!requireSuperAdmin(req, res)) return;
+  const { title, message, level, target_role } = req.body || {};
+  if (!title || !message) return res.status(400).json({ error: "title и message обязательны" });
+  const lvl = ["info", "success", "warning", "error"].includes(level) ? level : "info";
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    const [result] = await connection.execute(
+      "INSERT INTO notifications (title, message, level, target_role) VALUES (?, ?, ?, ?)",
+      [title, message, lvl, target_role || "ALL"]
+    );
+    const [rows] = await connection.execute("SELECT * FROM notifications WHERE id = ?", [result.insertId]);
+    res.status(201).json({ ...rows[0], is_read: false });
+  } catch (error) {
+    console.error("Error POST /api/dev/notifications/broadcast:", error.message);
+    res.status(500).json({ error: `Внутренняя ошибка сервера: ${error.message}` });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// --- Dev / служебные --------------------------------------------------
+app.get("/public/dev/ping", (req, res) => {
+  res.json({ ok: true, service: "nova-backend", ts: Date.now() });
+});
+
+app.get("/public/desktop/update", (req, res) => {
+  res.json({
+    latestVersion: "1.0.0",
+    downloadUrl: `${publicDomain}/public/desktop/download`,
+    releaseNotes: ["Первый релиз Nova Desktop"],
+    message: "Актуальная версия Nova Desktop",
+    reloadAfterInstall: true,
+  });
+});
+
+app.get("/api/dev/health", authenticate, async (req, res) => {
+  if (!requireSuperAdmin(req, res)) return;
+  let dbStatus = "down";
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.execute("SELECT 1");
+    dbStatus = "up";
+  } catch (error) {
+    dbStatus = "down";
+  } finally {
+    if (connection) connection.release();
+  }
+  res.json({
+    ok: dbStatus === "up",
+    now: new Date().toISOString(),
+    uptimeSec: Math.round(process.uptime()),
+    env: process.env.NODE_ENV || "production",
+    db: dbStatus,
+    node: process.version,
+  });
+});
+
+// --- Сброс пароля -----------------------------------------------------
+const crypto = require("crypto");
+
+app.post("/public/password-reset/request", async (req, res) => {
+  const { email } = req.body || {};
+  if (!email) return res.status(400).json({ error: "Email обязателен" });
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    const [users] = await connection.execute("SELECT id FROM users1 WHERE email = ?", [email]);
+    // Не раскрываем, существует ли пользователь
+    if (users.length === 0) {
+      return res.json({ ok: true, message: "Если аккаунт существует, ссылка для сброса отправлена" });
+    }
+    const token = crypto.randomBytes(32).toString("hex");
+    const expires = new Date(Date.now() + 60 * 60 * 1000); // 1 час
+    await connection.execute(
+      "INSERT INTO password_resets (user_id, token, expires_at) VALUES (?, ?, ?)",
+      [users[0].id, token, expires.toISOString().slice(0, 19).replace("T", " ")]
+    );
+    const resetLink = `${publicDomain}/reset-password?token=${token}`;
+    res.json({ ok: true, message: "Ссылка для сброса пароля создана", resetLink });
+  } catch (error) {
+    console.error("Error password-reset/request:", error.message);
+    res.status(500).json({ error: `Внутренняя ошибка сервера: ${error.message}` });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+app.post("/public/password-reset/confirm", async (req, res) => {
+  const { token, password } = req.body || {};
+  if (!token || !password) return res.status(400).json({ error: "token и password обязательны" });
+  if (String(password).length < 6) return res.status(400).json({ error: "Пароль должен быть не короче 6 символов" });
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    const [rows] = await connection.execute(
+      "SELECT id, user_id FROM password_resets WHERE token = ? AND used = 0 AND expires_at > NOW() LIMIT 1",
+      [token]
+    );
+    if (rows.length === 0) return res.status(400).json({ error: "Ссылка недействительна или истекла" });
+    const hashed = await bcrypt.hash(password, 10);
+    await connection.execute("UPDATE users1 SET password = ?, token = NULL WHERE id = ?", [hashed, rows[0].user_id]);
+    await connection.execute("UPDATE password_resets SET used = 1 WHERE id = ?", [rows[0].id]);
+    res.json({ ok: true, message: "Пароль успешно изменён" });
+  } catch (error) {
+    console.error("Error password-reset/confirm:", error.message);
+    res.status(500).json({ error: `Внутренняя ошибка сервера: ${error.message}` });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
 // Start Server
 app.listen(port, () => {
   console.log(`Server running on http://localhost:${port}`);
