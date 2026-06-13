@@ -2512,9 +2512,9 @@ app.get("/api/variants", authenticate, async (req, res) => {
       params.push(filterId);
     }
     const sql =
-      "SELECT id, mkv, address, price, status, curator_id, created_at FROM properties" +
+      "SELECT id, mkv, address, price, status, curator_id, owner_name, owner_phone, created_at FROM properties" +
       (where.length ? ` WHERE ${where.join(" AND ")}` : "") +
-      " ORDER BY id ASC";
+      " ORDER BY id DESC";
     const [rows] = await connection.execute(sql, params);
     res.json(
       rows.map((row) => ({
@@ -2526,6 +2526,8 @@ app.get("/api/variants", authenticate, async (req, res) => {
         price: row.price,
         status: row.status,
         curator_id: row.curator_id,
+        owner_name: row.owner_name || null,
+        owner_phone: row.owner_phone || null,
       }))
     );
   } catch (error) {
