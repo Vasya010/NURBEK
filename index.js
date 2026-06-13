@@ -13,7 +13,7 @@ const port = process.env.PORT || 5000;
 const publicDomain = process.env.PUBLIC_DOMAIN || "https://vasya010-nurbek-b586.twc1.net";
 const jwtSecret = process.env.JWT_SECRET || "your_jwt_secret_123";
 
-// Valid roles for validation12
+// Valid roles for validation1255
 const VALID_ROLES = ['USER', 'ADMIN', 'SUPER_ADMIN', 'REALTOR'];
 
 // S3 Configuration
